@@ -13,13 +13,7 @@ from dotenv import load_dotenv
 
 
 # Variables globales
-old_signal_info = ""
-old_battery_charge = ""
-old_network_info = ""
-old_time = time.time()
-last_signal_check = 0
-signal_check_interval = 30  # seconds
-running = True
+# Ajouter l'abonnement pour recevoir des SMS à envoyer
 
 # Callback MQTT lors de la connexion
 def on_mqtt_connect(client, userdata, flags, rc, properties=None):
@@ -179,7 +173,6 @@ if __name__ == "__main__":
     mqttclientid = os.getenv("CLIENTID")
     mqttuser = os.getenv("MQTT_ACCOUNT")
     mqttpassword = os.getenv("MQTT_PASSWORD")
-
     huawei_router_ip = os.getenv("HUAWEI_ROUTER_IP_ADDRESS")
     delay_second = int(os.getenv("DELAY_SECOND", 10))
 
@@ -204,8 +197,7 @@ if __name__ == "__main__":
     mqtt_client.on_connect = on_mqtt_connect
     mqtt_client.on_disconnect = on_mqtt_disconnect
     mqtt_client.connect(mqtthost, mqttport)
-    # Ajouter l'abonnement pour recevoir des SMS à envoyer
-    mqtt_client.message_callback_add(f"{mqttprefix}/send", on_mqtt_message)
+    mqtt_client.message_callback_add(f"{mqttprefix}/send", on_mqtt_message) # Ajouter l'abonnement pour recevoir des SMS à envoyer
 
     # Gestion des signaux pour arrêt propre
     signal.signal(signal.SIGINT, shutdown)
