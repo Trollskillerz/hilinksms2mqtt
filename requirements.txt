@@ -1,0 +1,4 @@
+paho-mqtt==1.6.1
+huawei-lte-api==1.6.7
+python-dotenv==0.19.2
+aiohttp==3.8.1
