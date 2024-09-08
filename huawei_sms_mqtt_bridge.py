@@ -29,18 +29,26 @@ class HuaweiSMSMQTTBridge:
         self.huawei_client = None
         self.mqtt_client = None
         self.loop = None
-
+    
+    @staticmethod
+    def get_env(key, default=None):
+        value = os.environ.get(key, default)
+        if value is None:
+            raise ValueError(f"La variable d'environnement '{key}' est requise mais n'est pas définie.")
+        return value
+        
     def load_config(self):
-        load_dotenv()
-        self.mqtt_prefix = os.getenv("MQTT_TOPIC")
-        self.mqtt_host = os.getenv("MQTT_IP")
-        self.mqtt_port = int(os.getenv("PORT", 1883))
-        self.mqtt_client_id = os.getenv("CLIENTID")
-        self.mqtt_user = os.getenv("MQTT_ACCOUNT")
-        self.mqtt_password = os.getenv("MQTT_PASSWORD")
-        self.huawei_router_ip = os.getenv("HUAWEI_ROUTER_IP_ADDRESS")
-        self.delay_second = int(os.getenv("DELAY_SECOND", 10))
-        self.signal_check_interval = int(os.getenv("SIGNAL_CHECK_INTERVAL", 60))
+        if os.path.exists('.env'):
+            load_dotenv()
+        self.mqtt_prefix = self.get_env("MQTT_TOPIC")
+        self.mqtt_host = self.get_env("MQTT_IP")
+        self.mqtt_port = int(self.get_env("PORT", "1883"))
+        self.mqtt_client_id = self.get_env("CLIENTID")
+        self.mqtt_user = self.get_env("MQTT_ACCOUNT")
+        self.mqtt_password = self.get_env("MQTT_PASSWORD")
+        self.huawei_router_ip = self.get_env("HUAWEI_ROUTER_IP_ADDRESS")
+        self.delay_second = int(self.get_env("DELAY_SECOND", "10"))
+        self.signal_check_interval = int(self.get_env("SIGNAL_CHECK_INTERVAL", "60"))
 
     def setup_logging(self):
         logging.basicConfig(
