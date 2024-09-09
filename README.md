@@ -1,13 +1,12 @@
 # Huawei SMS MQTT Bridge
 
-Ce projet est un pont entre un routeur Huawei et un broker MQTT, permettant de recevoir et d'envoyer des SMS via MQTT.
+Ce projet est un pont entre une clé LTE Huawei E3372-320 et un broker MQTT, permettant de recevoir et d'envoyer des SMS via MQTT.
 
 ## Fonctionnalités
 
-- Réception des SMS du routeur Huawei et publication sur MQTT
+- Réception des SMS de la clé Huawei et publication sur MQTT
 - Envoi de SMS via MQTT
 - Surveillance de la qualité du signal et des informations réseau
-- Gestion robuste des déconnexions
 
 ## Prérequis
 
