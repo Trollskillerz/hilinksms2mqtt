@@ -31,21 +31,10 @@ SIGNAL_CHECK_INTERVAL=60
 
 ## Installation
 
-### Sans Docker
-
 1. Clonez ce dépôt
 2. Installez les dépendances : `pip install -r requirements.txt`
 3. Configurez le fichier `.env`
 4. Lancez le script : `python huawei_sms_mqtt_bridge.py`
-
-### Avec Docker
-
-1. Clonez ce dépôt
-2. Configurez le fichier `.env`
-3. Construisez et lancez le conteneur :
-   ```
-   docker-compose up -d
-   ```
 
 ## Utilisation
 
@@ -59,9 +48,6 @@ json
 "message": "Votre message ici"
 }
 ```
-## Contribution
-
-Les contributions sont les bienvenues ! N'hésitez pas à ouvrir une issue ou une pull request.
 
 ## Licence
 
