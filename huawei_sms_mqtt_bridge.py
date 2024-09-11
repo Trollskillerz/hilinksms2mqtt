@@ -4,11 +4,12 @@ import os
 import signal
 import json
 import asyncio
+import pycurl
 import paho.mqtt.client as mqtt
+from datetime import datetime
 from xml.etree import ElementTree as ET
 from dotenv import load_dotenv
 from queue import Queue
-import pycurl
 from io import BytesIO
 
 class HuaweiSMSMQTTBridge:
@@ -73,13 +74,13 @@ class HuaweiSMSMQTTBridge:
         self.token = root.find('.//TokInfo').text
         self.logger.info(f"Nouveaux tokens obtenus: Cookie: {self.cookie}, Token: {self.token}")
 
-    def send_sms(self, phone, content):
+    def send_sms(self, phone, content, retry=False):
         current_time = time.time()
-        if current_time - self.last_sms_time < self.sms_cooldown:
+        if not retry and current_time - self.last_sms_time < self.sms_cooldown:
             self.logger.info(f"Attente de {self.sms_cooldown - (current_time - self.last_sms_time):.2f} secondes avant le prochain envoi")
             time.sleep(self.sms_cooldown - (current_time - self.last_sms_time))
 
-        self.get_session_token()  # Obtenir de nouveaux tokens avant chaque envoi
+        self.get_session_token()
         self.logger.info(f"Tentative d'envoi de SMS à {phone}")
         buffer = BytesIO()
         c = pycurl.Curl()
@@ -98,9 +99,33 @@ class HuaweiSMSMQTTBridge:
         response = buffer.getvalue().decode('utf-8')
         self.logger.info(f"Réponse du serveur pour l'envoi de SMS: {response}")
         success = "<response>OK</response>" in response
+        
+        # Préparer le payload pour la publication MQTT
+        payload = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "status": "success" if success else "failure",
+            "recipient": phone,
+            "message": content
+        }
+        # Publier le résultat sur MQTT
+        self.mqtt_client.publish(f"{self.mqtt_prefix}/sent", json.dumps(payload))
+        
         if success:
             self.last_sms_time = time.time()
+            self.logger.info(f"SMS envoyé avec succès à {phone}")
+        else:
+            self.logger.error(f"Échec de l'envoi du SMS à {phone}")
+            if not retry:
+                self.logger.info(f"Planification d'une nouvelle tentative dans 30 secondes")
+                self.loop.call_later(30, self.retry_sms, phone, content)
+        
         return success
+    
+    def retry_sms(self, phone, content):
+        self.logger.info(f"Nouvelle tentative d'envoi de SMS à {phone}")
+        success = self.send_sms(phone, content, retry=True)
+        if not success:
+            self.logger.error(f"Échec de la seconde tentative d'envoi de SMS à {phone}. Abandon de l'envoi.")
 
     def on_mqtt_connect(self, client, userdata, flags, rc, properties=None):
         self.logger.info("Connecté au serveur MQTT")
@@ -109,7 +134,6 @@ class HuaweiSMSMQTTBridge:
 
     def on_mqtt_disconnect(self, client, userdata, rc, properties=None, reasonCode=None):
         self.logger.info("Déconnecté du serveur MQTT")
-        self.shutdown()
 
     def on_mqtt_message(self, client, userdata, msg):
         try:
@@ -132,11 +156,7 @@ class HuaweiSMSMQTTBridge:
             number = sms_request.get('number')
             message = sms_request.get('message')
             if number and message:
-                success = self.send_sms(number, message)
-                if success:
-                    self.logger.info(f"SMS envoyé avec succès à {number}")
-                else:
-                    self.logger.error(f"Échec de l'envoi du SMS à {number}")
+                self.send_sms(number, message)
 
     async def check_and_publish_status_info(self):
         try:
@@ -265,24 +285,32 @@ class HuaweiSMSMQTTBridge:
         pass
 
     async def main_loop(self):
-        while self.running:
-            current_time = time.time()
+        try:
+            while self.running:
+                current_time = time.time()
 
-            # Traitement de la file d'attente SMS
-            await self.process_sms_queue()
+                # Traitement de la file d'attente SMS
+                await self.process_sms_queue()
 
-            # Vérification et publication du statut
-            if current_time - self.last_status_check >= self.status_check_interval:
-                await self.check_and_publish_status_info()
-                self.last_status_check = current_time
-            if current_time - self.last_signal_check >= self.signal_check_interval:
-                await self.get_signal_info()
-                self.last_signal_check = current_time
-            if current_time - self.last_network_check >= self.network_check_interval:
-                await self.get_network_info()
-                self.last_network_check = current_time
-            # Petite pause pour éviter une utilisation excessive du CPU
-            await asyncio.sleep(0.1)
+                # Vérification et publication du statut
+                if current_time - self.last_status_check >= self.status_check_interval:
+                    await self.check_and_publish_status_info()
+                    self.last_status_check = current_time
+
+                # Vérification et publication des informations de signal
+                if current_time - self.last_signal_check >= self.signal_check_interval:
+                    await self.get_signal_info()
+                    self.last_signal_check = current_time
+
+                # Vérification et publication des informations réseau
+                if current_time - self.last_network_check >= self.network_check_interval:
+                    await self.get_network_info()
+                    self.last_network_check = current_time
+
+                # Petite pause pour éviter une utilisation excessive du CPU
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            self.logger.info("Boucle principale annulée")
 
     def run(self):
         self.logger.info("Démarrage du bridge")
@@ -301,8 +329,8 @@ class HuaweiSMSMQTTBridge:
             self.logger.info("Boucle MQTT démarrée")
 
             self.loop = asyncio.get_event_loop()
-            self.loop.add_signal_handler(signal.SIGINT, self.shutdown)
-            self.loop.add_signal_handler(signal.SIGTERM, self.shutdown)
+            self.loop.add_signal_handler(signal.SIGINT, self.signal_handler)
+            self.loop.add_signal_handler(signal.SIGTERM, self.signal_handler)
             self.logger.info("Démarrage de la boucle principale")
             self.loop.run_until_complete(self.main_loop())
         except Exception as e:
@@ -310,12 +338,11 @@ class HuaweiSMSMQTTBridge:
         finally:
             self.force_shutdown()
 
-    def shutdown(self):
-        self.logger.info("Arrêt gracieux...")
+    def signal_handler(self):
+        self.logger.info("Signal reçu, arrêt en cours...")
         self.running = False
-        if self.loop:
-            for task in asyncio.all_tasks(self.loop):
-                task.cancel()
+        for task in asyncio.all_tasks(self.loop):
+            task.cancel()
 
     def force_shutdown(self):
         self.logger.info("Forçage de l'arrêt...")
@@ -326,6 +353,15 @@ class HuaweiSMSMQTTBridge:
         if self.loop:
             self.loop.stop()
         self.logger.info("Arrêt terminé")
+
+    async def shutdown(self):
+        if not self.running:
+            return
+        self.logger.info("Arrêt gracieux...")
+        self.running = False
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        [task.cancel() for task in tasks]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 if __name__ == "__main__":
     bridge = HuaweiSMSMQTTBridge()
