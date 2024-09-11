@@ -33,7 +33,18 @@ class HuaweiSMSMQTTBridge:
         self.network_check_interval = 60  # 60 secondes entre chaque vérification
         self.old_network_info = {}
         self.loop = None
+        self.last_token_time = 0
+        self.token_refresh_interval = 5  # 5 secondes, ou ajustez selon vos besoins        
 
+    def setup_logging(self):
+        numeric_level = getattr(logging, self.debug_level, None)
+        if not isinstance(numeric_level, int):
+            raise ValueError(f'Niveau de log invalide : {self.debug_level}')
+        
+        logging.basicConfig(level=numeric_level,
+                            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        self.logger = logging.getLogger("HuaweiSMSMQTTBridge")
+        self.logger.info(f"Niveau de logging configuré à : {self.debug_level}")
 
     @staticmethod
     def get_env(key, default=None):
@@ -54,12 +65,11 @@ class HuaweiSMSMQTTBridge:
         self.huawei_router_ip = self.get_env("HUAWEI_ROUTER_IP_ADDRESS")
         self.delay_second = int(self.get_env("DELAY_SECOND", "10"))
         self.signal_check_interval = int(self.get_env("SIGNAL_CHECK_INTERVAL", "60"))
-
-    def setup_logging(self):
-        logging.basicConfig(level=logging.DEBUG, 
-                            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        self.logger = logging.getLogger("HuaweiSMSMQTTBridge")
-
+        self.debug_level = os.environ.get("DEBUG_LEVEL", "INFO").upper()
+        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+        if self.debug_level not in valid_levels:
+            raise ValueError(f"Niveau de debug invalide : {self.debug_level}. Les valeurs valides sont : {', '.join(valid_levels)}")
+        
     def get_session_token(self):
         buffer = BytesIO()
         c = pycurl.Curl()
@@ -72,16 +82,98 @@ class HuaweiSMSMQTTBridge:
         root = ET.fromstring(response)
         self.cookie = root.find('.//SesInfo').text
         self.token = root.find('.//TokInfo').text
-        self.logger.info(f"Nouveaux tokens obtenus: Cookie: {self.cookie}, Token: {self.token}")
 
-    def send_sms(self, phone, content, retry=False):
+        self.logger.debug(f"Tokens mis à jour - Cookie: {self.cookie[:10]}... Token: {self.token[:10]}...")
+
+    async def check_and_publish_received_sms(self):
+        try:
+            self.get_session_token()
+            
+            page_index = 1
+            max_sms_per_check = 5  # Limite le nombre de SMS traités à chaque vérification
+            sms_processed = 0
+
+            while sms_processed < max_sms_per_check:
+                buffer = BytesIO()
+                c = pycurl.Curl()
+                c.setopt(c.URL, f"http://{self.huawei_router_ip}/api/sms/sms-list")
+                c.setopt(c.HTTPHEADER, [
+                    f"Cookie: {self.cookie}",
+                    f"__RequestVerificationToken: {self.token}",
+                    "Content-Type: application/x-www-form-urlencoded; charset=UTF-8"
+                ])
+                data = f"""<?xml version='1.0' encoding='UTF-8'?><request><PageIndex>{page_index}</PageIndex><ReadCount>20</ReadCount><BoxType>1</BoxType><SortType>0</SortType><Ascending>0</Ascending><UnreadPreferred>1</UnreadPreferred></request>"""
+                c.setopt(c.POSTFIELDS, data)
+                c.setopt(c.WRITEDATA, buffer)
+                c.perform()
+                c.close()
+
+                response = buffer.getvalue().decode('utf-8')
+                root = ET.fromstring(response)
+
+                unread_messages = root.findall('.//Message[Smstat="0"]')
+                if not unread_messages:
+                    break  # Pas de nouveaux messages non lus sur cette page
+
+                for message in unread_messages:
+                    if sms_processed >= max_sms_per_check:
+                        break
+
+                    sms_index = message.find('Index').text
+                    phone = message.find('Phone').text
+                    content = message.find('Content').text
+                    date = message.find('Date').text
+
+                    # Publier le SMS reçu
+                    payload = {
+                        "sender": phone,
+                        "message": content,
+                        "date_received": date
+                    }
+                    self.mqtt_client.publish(f"{self.mqtt_prefix}/received", json.dumps(payload))
+                    self.logger.info(f"Nouveau SMS reçu de {phone} le {date}: {content[:20]}...")
+                    # Marquer le SMS comme lu
+                    await self.mark_sms_as_read(sms_index)
+
+                    sms_processed += 1
+                    await asyncio.sleep(0.5)  # Petit délai entre chaque traitement de SMS
+
+                page_index += 1
+
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la vérification des SMS reçus : {e}")
+
+    async def mark_sms_as_read(self, sms_index):
+        try:
+            self.get_session_token()
+            buffer = BytesIO()
+            c = pycurl.Curl()
+            c.setopt(c.URL, f"http://{self.huawei_router_ip}/api/sms/set-read")
+            c.setopt(c.HTTPHEADER, [
+                f"Cookie: {self.cookie}",
+                f"__RequestVerificationToken: {self.token}",
+                "Content-Type: application/x-www-form-urlencoded; charset=UTF-8"
+            ])
+            data = f"""<?xml version='1.0' encoding='UTF-8'?><request><Index>{sms_index}</Index></request>"""
+            c.setopt(c.POSTFIELDS, data)
+            c.setopt(c.WRITEDATA, buffer)
+            c.perform()
+            c.close()
+
+            response = buffer.getvalue().decode('utf-8')
+            self.logger.debug(f"Réponse pour marquer le SMS comme lu : {response}")
+
+        except Exception as e:
+            self.logger.error(f"Erreur lors du marquage du SMS comme lu : {e}")
+
+    def send_sms(self, phone, content, retry=False, retry_count=0):
+        self.get_session_token()
         current_time = time.time()
         if not retry and current_time - self.last_sms_time < self.sms_cooldown:
-            self.logger.info(f"Attente de {self.sms_cooldown - (current_time - self.last_sms_time):.2f} secondes avant le prochain envoi")
-            time.sleep(self.sms_cooldown - (current_time - self.last_sms_time))
-
-        self.get_session_token()
-        self.logger.info(f"Tentative d'envoi de SMS à {phone}")
+            wait_time = self.sms_cooldown - (current_time - self.last_sms_time)
+            self.logger.info(f"Attente de {wait_time:.2f} secondes avant le prochain envoi")
+            time.sleep(wait_time)
+        self.logger.debug(f"Tentative d'envoi de SMS à {phone}")
         buffer = BytesIO()
         c = pycurl.Curl()
         c.setopt(c.URL, f"http://{self.huawei_router_ip}/api/sms/send-sms")
@@ -97,9 +189,10 @@ class HuaweiSMSMQTTBridge:
         c.close()
 
         response = buffer.getvalue().decode('utf-8')
-        self.logger.info(f"Réponse du serveur pour l'envoi de SMS: {response}")
         success = "<response>OK</response>" in response
-        
+        status = "OK" if success else "Failed"
+        self.logger.debug(f"Réponse du serveur pour l'envoi de SMS: {status}")
+            
         # Préparer le payload pour la publication MQTT
         payload = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -109,15 +202,16 @@ class HuaweiSMSMQTTBridge:
         }
         # Publier le résultat sur MQTT
         self.mqtt_client.publish(f"{self.mqtt_prefix}/sent", json.dumps(payload))
+        self.logger.debug(f"Réponse complète du serveur : {response}")
         
         if success:
             self.last_sms_time = time.time()
             self.logger.info(f"SMS envoyé avec succès à {phone}")
         else:
             self.logger.error(f"Échec de l'envoi du SMS à {phone}")
-            if not retry:
-                self.logger.info(f"Planification d'une nouvelle tentative dans 30 secondes")
-                self.loop.call_later(30, self.retry_sms, phone, content)
+            if not retry and retry_count < 3:  # Limite à 3 tentatives
+                self.logger.info(f"Planification d'une nouvelle tentative dans 30 secondes (tentative {retry_count + 1}/3)")
+                self.loop.call_later(30, lambda: self.send_sms(phone, content, True, retry_count + 1))
         
         return success
     
@@ -144,7 +238,9 @@ class HuaweiSMSMQTTBridge:
 
             self.logger.info(f"Message reçu sur le topic '{msg.topic}': {payload}")
             if msg.topic == f"{self.mqtt_prefix}/send":
-                self.sms_queue.put(payload)
+                number = payload['number']
+                message = payload['message']
+                self.send_sms(number, message)
         except json.JSONDecodeError as e:
             self.logger.error(f"Erreur de décodage JSON: {e}")
         except Exception as e:
@@ -198,7 +294,7 @@ class HuaweiSMSMQTTBridge:
     def publish_status_info(self, status_info):
         if status_info:
             self.mqtt_client.publish(f"{self.mqtt_prefix}/status", json.dumps(status_info), 0, True)
-            self.logger.info(f"Informations de statut publiées : {status_info}")
+            self.logger.info(f"Nouvelles informations de statut publiées : ConnectionStatus={status_info.get('ConnectionStatus')}, SignalStrength={status_info.get('SignalIcon')}")
 
     async def get_signal_info(self):
         try:
@@ -236,7 +332,7 @@ class HuaweiSMSMQTTBridge:
                 signal_payload = json.dumps(signal_info)
                 self.mqtt_client.publish(f"{self.mqtt_prefix}/signal", signal_payload)
                 self.old_signal_info = signal_info
-                self.logger.info(f"Nouvelles informations de signal publiées : {signal_info}")
+                self.logger.info(f"Nouvelles informations de signal publiées : RSRP={signal_info['rsrp']}, RSRQ={signal_info['rsrq']}")
             else:
                 self.logger.debug("Pas de changement dans les informations de signal")
 
@@ -273,7 +369,7 @@ class HuaweiSMSMQTTBridge:
                 network_payload = json.dumps(network_info)
                 self.mqtt_client.publish(f"{self.mqtt_prefix}/network", network_payload)
                 self.old_network_info = network_info
-                self.logger.info(f"Nouvelles informations réseau publiées : {network_info}")
+                self.logger.info(f"Nouvelles informations réseau publiées : DeviceName={network_info['DeviceName']}, workmode={network_info['workmode']}, Mccmnc={network_info['Mccmnc']}, uptime={network_info['uptime']}")
             else:
                 self.logger.debug("Pas de changement dans les informations réseau")
 
@@ -288,25 +384,21 @@ class HuaweiSMSMQTTBridge:
         try:
             while self.running:
                 current_time = time.time()
-
                 # Traitement de la file d'attente SMS
                 await self.process_sms_queue()
-
                 # Vérification et publication du statut
                 if current_time - self.last_status_check >= self.status_check_interval:
                     await self.check_and_publish_status_info()
                     self.last_status_check = current_time
-
                 # Vérification et publication des informations de signal
                 if current_time - self.last_signal_check >= self.signal_check_interval:
                     await self.get_signal_info()
                     self.last_signal_check = current_time
-
                 # Vérification et publication des informations réseau
                 if current_time - self.last_network_check >= self.network_check_interval:
                     await self.get_network_info()
                     self.last_network_check = current_time
-
+                await self.check_and_publish_received_sms()
                 # Petite pause pour éviter une utilisation excessive du CPU
                 await asyncio.sleep(0.1)
         except asyncio.CancelledError:
