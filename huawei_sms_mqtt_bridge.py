@@ -61,7 +61,6 @@ class HuaweiSMSMQTTBridge:
         self.mqtt_user = self.get_env("MQTT_ACCOUNT")
         self.mqtt_password = self.get_env("MQTT_PASSWORD")
         self.huawei_router_ip = self.get_env("HUAWEI_ROUTER_IP_ADDRESS")
-        self.delay_second = int(self.get_env("DELAY_SECOND", "10"))
         self.check_interval = int(self.get_env("CHECK_INTERVAL", "60"))
         self.sms_check_interval = int(self.get_env("SMS_CHECK_INTERVAL", "30"))
         self.debug_level = os.environ.get("DEBUG_LEVEL", "INFO").upper()
