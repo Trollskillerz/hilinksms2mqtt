@@ -3,40 +3,44 @@ import time
 import os
 import signal
 import json
-import paho.mqtt.client as mqtt
-from huawei_lte_api.Client import Client
-from huawei_lte_api.AuthorizedConnection import AuthorizedConnection
-from huawei_lte_api.enums.sms import BoxTypeEnum
-from huawei_lte_api.enums.client import ResponseEnum
-import huawei_lte_api.exceptions
-from dotenv import load_dotenv
-from typing import Dict, Any
 import asyncio
-import aiohttp
-
-class ConnectionLostError(Exception):
-    pass
+import paho.mqtt.client as mqtt
+from xml.etree import ElementTree as ET
+from dotenv import load_dotenv
+from queue import Queue
+import pycurl
+from io import BytesIO
 
 class HuaweiSMSMQTTBridge:
     def __init__(self):
         self.load_config()
         self.setup_logging()
         self.running = True
-        self.old_signal_info: Dict[str, Any] = {}
-        self.last_signal_check = 0
-        self.old_network_info: Dict[str, Any] = {}
-        self.old_time = 0
-        self.huawei_client = None
         self.mqtt_client = None
+        self.sms_queue = Queue()
+        self.cookie = None
+        self.token = None
+        self.last_sms_time = 0
+        self.sms_cooldown = 10  # Temps d'attente entre les SMS en secondes
+        self.last_status_check = 0
+        self.status_check_interval = 60  # 60 secondes entre chaque vérification
+        self.old_status_info = {}
+        self.last_signal_check = 0
+        self.signal_check_interval = 60  # 60 secondes entre chaque vérification
+        self.old_signal_info = {}
+        self.last_network_check = 0
+        self.network_check_interval = 60  # 60 secondes entre chaque vérification
+        self.old_network_info = {}
         self.loop = None
-    
+
+
     @staticmethod
     def get_env(key, default=None):
         value = os.environ.get(key, default)
         if value is None:
             raise ValueError(f"La variable d'environnement '{key}' est requise mais n'est pas définie.")
         return value
-        
+
     def load_config(self):
         if os.path.exists('.env'):
             load_dotenv()
@@ -51,237 +55,278 @@ class HuaweiSMSMQTTBridge:
         self.signal_check_interval = int(self.get_env("SIGNAL_CHECK_INTERVAL", "60"))
 
     def setup_logging(self):
-        logging.basicConfig(
-            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            level=logging.INFO,
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
+        logging.basicConfig(level=logging.DEBUG, 
+                            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger("HuaweiSMSMQTTBridge")
 
-    async def initialize_huawei_client(self):
-        url = f'http://{self.huawei_router_ip}/'
-        for attempt in range(5):
-            try:
-                self.logger.info(f"Connecting to Huawei LTE API at {url}")
-                connection = AuthorizedConnection(url)
-                self.huawei_client = Client(connection)
-                return
-            except Exception as e:
-                self.logger.error(f'Attempt {attempt + 1} failed to connect to Huawei LTE API: {e}')
-                await asyncio.sleep(5)
-        self.logger.error('All attempts to initialize Huawei LTE API client failed.')
-        raise Exception("Failed to initialize Huawei LTE API client")
+    def get_session_token(self):
+        buffer = BytesIO()
+        c = pycurl.Curl()
+        c.setopt(c.URL, f"http://{self.huawei_router_ip}/api/webserver/SesTokInfo")
+        c.setopt(c.WRITEDATA, buffer)
+        c.perform()
+        c.close()
 
-    async def check_connection(self):
-        try:
-            await asyncio.wait_for(asyncio.to_thread(self.huawei_client.device.information), timeout=10)
-        except (asyncio.TimeoutError, Exception) as e:
-            self.logger.error(f"Connection to Huawei router lost: {e}")
-            raise ConnectionLostError("Connection to Huawei router lost")
+        response = buffer.getvalue().decode('utf-8')
+        root = ET.fromstring(response)
+        self.cookie = root.find('.//SesInfo').text
+        self.token = root.find('.//TokInfo').text
+        self.logger.info(f"Nouveaux tokens obtenus: Cookie: {self.cookie}, Token: {self.token}")
+
+    def send_sms(self, phone, content):
+        current_time = time.time()
+        if current_time - self.last_sms_time < self.sms_cooldown:
+            self.logger.info(f"Attente de {self.sms_cooldown - (current_time - self.last_sms_time):.2f} secondes avant le prochain envoi")
+            time.sleep(self.sms_cooldown - (current_time - self.last_sms_time))
+
+        self.get_session_token()  # Obtenir de nouveaux tokens avant chaque envoi
+        self.logger.info(f"Tentative d'envoi de SMS à {phone}")
+        buffer = BytesIO()
+        c = pycurl.Curl()
+        c.setopt(c.URL, f"http://{self.huawei_router_ip}/api/sms/send-sms")
+        c.setopt(c.HTTPHEADER, [
+            f"Cookie: {self.cookie}",
+            f"__RequestVerificationToken: {self.token}",
+            "Content-Type: application/x-www-form-urlencoded; charset=UTF-8"
+        ])
+        data = f"""<?xml version='1.0' encoding='UTF-8'?><request><Index>-1</Index><Phones><Phone>{phone}</Phone></Phones><Sca></Sca><Content>{content}</Content><Length>{len(content)}</Length><Reserved>1</Reserved><Date>-1</Date></request>"""
+        c.setopt(c.POSTFIELDS, data)
+        c.setopt(c.WRITEDATA, buffer)
+        c.perform()
+        c.close()
+
+        response = buffer.getvalue().decode('utf-8')
+        self.logger.info(f"Réponse du serveur pour l'envoi de SMS: {response}")
+        success = "<response>OK</response>" in response
+        if success:
+            self.last_sms_time = time.time()
+        return success
 
     def on_mqtt_connect(self, client, userdata, flags, rc, properties=None):
-        self.logger.info("Connected to MQTT host")
+        self.logger.info("Connecté au serveur MQTT")
         client.publish(f"{self.mqtt_prefix}/connected", "1", 0, True)
         client.subscribe(f"{self.mqtt_prefix}/send")
 
     def on_mqtt_disconnect(self, client, userdata, rc, properties=None, reasonCode=None):
-        self.logger.info("Disconnected from MQTT host")
+        self.logger.info("Déconnecté du serveur MQTT")
         self.shutdown()
 
     def on_mqtt_message(self, client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode())
             if not isinstance(payload, dict) or 'number' not in payload or 'message' not in payload:
-                self.logger.error(f"Invalid payload format: {msg.payload.decode()}")
+                self.logger.error(f"Format de payload invalide: {msg.payload.decode()}")
                 return
 
-            self.logger.info(f"Received message on topic '{msg.topic}': {payload}")
+            self.logger.info(f"Message reçu sur le topic '{msg.topic}': {payload}")
             if msg.topic == f"{self.mqtt_prefix}/send":
-                self.logger.info(f"Processing SMS send request: {payload}")
-                asyncio.run_coroutine_threadsafe(self.send_sms(payload), self.loop)
+                self.sms_queue.put(payload)
         except json.JSONDecodeError as e:
-            self.logger.error(f"JSON decoding error: {e}")
+            self.logger.error(f"Erreur de décodage JSON: {e}")
         except Exception as e:
-            self.logger.error(f"Error processing incoming MQTT message on topic '{msg.topic}': {e}")
+            self.logger.error(f"Erreur lors du traitement du message MQTT entrant sur le topic '{msg.topic}': {e}")
 
-    async def get_and_publish_sms(self):
+    async def process_sms_queue(self):
+        if not self.sms_queue.empty():
+            sms_request = self.sms_queue.get()
+            number = sms_request.get('number')
+            message = sms_request.get('message')
+            if number and message:
+                success = self.send_sms(number, message)
+                if success:
+                    self.logger.info(f"SMS envoyé avec succès à {number}")
+                else:
+                    self.logger.error(f"Échec de l'envoi du SMS à {number}")
+
+    async def check_and_publish_status_info(self):
         try:
-            await self.check_connection()
-            sms_list = self.huawei_client.sms.get_sms_list(1, BoxTypeEnum.LOCAL_INBOX, 1, 0, 0, 1)
-            messages = sms_list.get('Messages', {}).get('Message', [])
-            if not messages:
-                self.logger.info("No new SMS.")
-                return
-
-            if isinstance(messages, dict):
-                messages = [messages]
-
-            for message in messages:
-                if int(message.get('Smstat', 1)) == 1:
-                    self.logger.info(f"No new SMS to read: {message.get('Index')}")
-                    continue
-
-                payload = json.dumps({
-                    "datetime": message.get('Date'),
-                    "number": message.get('Phone'),
-                    "text": message.get('Content')
-                }, ensure_ascii=False)
-                self.mqtt_client.publish(f"{self.mqtt_prefix}/received", payload)
-                self.logger.info(f"SMS published: {payload}")
-                self.huawei_client.sms.set_read(int(message.get('Index')))
-        except ConnectionLostError:
-            raise
+            status_info = self.get_status_info()
+            if status_info is not None:
+                if status_info != self.old_status_info:
+                    self.old_status_info = status_info
+                    self.publish_status_info(status_info)
         except Exception as e:
-            self.logger.error(f"Failed to retrieve SMS: {e}")
-            await self.reset_huawei_connection()
+            self.logger.error(f"Erreur lors de la vérification et de la publication des informations de statut : {e}")
+
+    def get_status_info(self):
+        try:
+            self.get_session_token()  # Obtenir de nouveaux tokens avant la requête
+            buffer = BytesIO()
+            c = pycurl.Curl()
+            c.setopt(c.URL, f"http://{self.huawei_router_ip}/api/monitoring/status")
+            c.setopt(c.HTTPHEADER, [
+                f"Cookie: {self.cookie}",
+                f"__RequestVerificationToken: {self.token}",
+            ])
+            c.setopt(c.WRITEDATA, buffer)
+            c.perform()
+            c.close()
+
+            response = buffer.getvalue().decode('utf-8')
+            root = ET.fromstring(response)
+            
+            status_info = {}
+            for element in root.iter():
+                if element.tag != "response":
+                    status_info[element.tag] = element.text
+
+            return status_info
+        except Exception as e:
+            self.logger.error(f"Erreur lors de la récupération des informations de statut : {e}")
+            return None
+
+    def publish_status_info(self, status_info):
+        if status_info:
+            self.mqtt_client.publish(f"{self.mqtt_prefix}/status", json.dumps(status_info), 0, True)
+            self.logger.info(f"Informations de statut publiées : {status_info}")
 
     async def get_signal_info(self):
         try:
-            await self.check_connection()
             if time.time() - self.last_signal_check < self.signal_check_interval:
                 return
             self.last_signal_check = time.time()
-            signal_info = self.huawei_client.device.signal()
-            if not isinstance(signal_info, dict):
-                raise ValueError("Invalid signal info format")
+
+            self.get_session_token()  # Obtenir de nouveaux tokens avant la requête
+            buffer = BytesIO()
+            c = pycurl.Curl()
+            c.setopt(c.URL, f"http://{self.huawei_router_ip}/api/device/signal")
+            c.setopt(c.HTTPHEADER, [
+                f"Cookie: {self.cookie}",
+                f"__RequestVerificationToken: {self.token}",
+            ])
+            c.setopt(c.WRITEDATA, buffer)
+            c.perform()
+            c.close()
+
+            response = buffer.getvalue().decode('utf-8')
+            root = ET.fromstring(response)
             
+            signal_info = {
+                "rsrp": root.find(".//rsrp").text,
+                "rsrq": root.find(".//rsrq").text,
+                "rssi": root.find(".//rssi").text,
+                "sinr": root.find(".//sinr").text,
+                "cell_id": root.find(".//cell_id").text,
+                "pci": root.find(".//pci").text,
+                "ecio": root.find(".//ecio").text,
+                "mode": root.find(".//mode").text,
+            }
+
             if signal_info != self.old_signal_info:
                 signal_payload = json.dumps(signal_info)
                 self.mqtt_client.publish(f"{self.mqtt_prefix}/signal", signal_payload)
                 self.old_signal_info = signal_info
-        except ConnectionLostError:
-            raise
+                self.logger.info(f"Nouvelles informations de signal publiées : {signal_info}")
+            else:
+                self.logger.debug("Pas de changement dans les informations de signal")
+
         except Exception as e:
-            self.logger.error(f"ERROR: Unable to check signal quality: {e}")
-            await self.reset_huawei_connection()
+            self.logger.error(f"ERROR: Impossible de vérifier la qualité du signal : {e}")
 
     async def get_network_info(self):
         try:
-            await self.check_connection()
-            network_info = self.huawei_client.device.information()
-            if not isinstance(network_info, dict):
-                raise ValueError("Invalid network info format")
+            if time.time() - self.last_network_check < self.network_check_interval:
+                return
+            self.last_network_check = time.time()
+
+            self.get_session_token()  # Obtenir de nouveaux tokens avant la requête
+            buffer = BytesIO()
+            c = pycurl.Curl()
+            c.setopt(c.URL, f"http://{self.huawei_router_ip}/api/device/information")
+            c.setopt(c.HTTPHEADER, [
+                f"Cookie: {self.cookie}",
+                f"__RequestVerificationToken: {self.token}",
+            ])
+            c.setopt(c.WRITEDATA, buffer)
+            c.perform()
+            c.close()
+
+            response = buffer.getvalue().decode('utf-8')
+            root = ET.fromstring(response)
             
+            network_info = {}
+            for element in root.iter():
+                if element.tag != "response":
+                    network_info[element.tag] = element.text
+
             if network_info != self.old_network_info:
                 network_payload = json.dumps(network_info)
                 self.mqtt_client.publish(f"{self.mqtt_prefix}/network", network_payload)
                 self.old_network_info = network_info
-        except ConnectionLostError:
-            raise
+                self.logger.info(f"Nouvelles informations réseau publiées : {network_info}")
+            else:
+                self.logger.debug("Pas de changement dans les informations réseau")
+
         except Exception as e:
-            self.logger.error(f"ERROR: Unable to check network info: {e}")
-            await self.reset_huawei_connection()
+            self.logger.error(f"ERROR: Impossible de vérifier les informations réseau : {e}")
 
     async def get_datetime(self):
+        # Implémentez cette méthode si nécessaire
+        pass
+
+    async def main_loop(self):
+        while self.running:
+            current_time = time.time()
+
+            # Traitement de la file d'attente SMS
+            await self.process_sms_queue()
+
+            # Vérification et publication du statut
+            if current_time - self.last_status_check >= self.status_check_interval:
+                await self.check_and_publish_status_info()
+                self.last_status_check = current_time
+            if current_time - self.last_signal_check >= self.signal_check_interval:
+                await self.get_signal_info()
+                self.last_signal_check = current_time
+            if current_time - self.last_network_check >= self.network_check_interval:
+                await self.get_network_info()
+                self.last_network_check = current_time
+            # Petite pause pour éviter une utilisation excessive du CPU
+            await asyncio.sleep(0.1)
+
+    def run(self):
+        self.logger.info("Démarrage du bridge")
         try:
-            now = time.time()
-            if (now - self.old_time) > 60:
-                self.mqtt_client.publish(f"{self.mqtt_prefix}/datetime", now)
-                self.old_time = now
+            self.get_session_token()
+            self.logger.info("Tokens de session obtenus")
+
+            self.mqtt_client = mqtt.Client(client_id=self.mqtt_client_id)
+            self.mqtt_client.username_pw_set(self.mqtt_user, self.mqtt_password)
+            self.mqtt_client.on_connect = self.on_mqtt_connect
+            self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
+            self.mqtt_client.message_callback_add(f"{self.mqtt_prefix}/send", self.on_mqtt_message)
+            self.logger.info("Tentative de connexion MQTT")
+            self.mqtt_client.connect(self.mqtt_host, self.mqtt_port)
+            self.mqtt_client.loop_start()
+            self.logger.info("Boucle MQTT démarrée")
+
+            self.loop = asyncio.get_event_loop()
+            self.loop.add_signal_handler(signal.SIGINT, self.shutdown)
+            self.loop.add_signal_handler(signal.SIGTERM, self.shutdown)
+            self.logger.info("Démarrage de la boucle principale")
+            self.loop.run_until_complete(self.main_loop())
         except Exception as e:
-            self.logger.error(f"ERROR: Unable to check datetime: {e}")
+            self.logger.error(f"Erreur dans la méthode run : {e}")
+        finally:
+            self.force_shutdown()
 
-    def shutdown(self, signum=None, frame=None):
-        if self.running:
-            self.logger.info("Shutting down gracefully...")
-            self.running = False
-            if self.loop and self.loop.is_running():
-                self.loop.create_task(self.force_shutdown())
-
-    async def force_shutdown(self):
-        self.logger.info("Forcing shutdown...")
+    def shutdown(self):
+        self.logger.info("Arrêt gracieux...")
         self.running = False
+        if self.loop:
+            for task in asyncio.all_tasks(self.loop):
+                task.cancel()
+
+    def force_shutdown(self):
+        self.logger.info("Forçage de l'arrêt...")
         if self.mqtt_client:
             self.mqtt_client.publish(f"{self.mqtt_prefix}/connected", "0", 0, True)
             self.mqtt_client.disconnect()
-        if self.loop:
-            for task in asyncio.all_tasks(self.loop):
-                if task is not asyncio.current_task():
-                    task.cancel()
-        # Arrêter le script
-        os._exit(0)
-
-    async def send_sms(self, payload):
-        try:
-            await self.check_connection()
-            number = payload.get('number')
-            message = payload.get('message')
-            
-            if not number or not message:
-                self.logger.error("Invalid payload, 'number' or 'message' missing.")
-                return
-
-            response = self.huawei_client.sms.send_sms([number], message)
-            if response == ResponseEnum.OK.value:
-                self.logger.info(f"SMS sent to {number}: {message}")
-                self.mqtt_client.publish(f"{self.mqtt_prefix}/sent", json.dumps({
-                    "status": "sent",
-                    "number": number,
-                    "message": message
-                }))
-            else:
-                self.logger.error(f"Failed to send SMS. Response code: {response}")
-        except ConnectionLostError:
-            raise
-        except Exception as e:
-            self.logger.error(f"Failed to send SMS: {e}")
-            await self.reset_huawei_connection()
-
-    async def reset_huawei_connection(self):
-        self.logger.info("Resetting Huawei connection...")
-        try:
-            await self.initialize_huawei_client()
-        except Exception:
-            self.logger.error("Failed to reset Huawei connection. Shutting down...")
-            await self.force_shutdown()
-
-    async def run(self):
-        self.loop = asyncio.get_running_loop()
-        try:
-            await self.initialize_huawei_client()
-        except Exception:
-            self.logger.error("Failed to initialize Huawei client. Exiting...")
-            return
-
-        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.mqtt_client_id)
-        self.mqtt_client.username_pw_set(self.mqtt_user, self.mqtt_password)
-        self.mqtt_client.on_connect = self.on_mqtt_connect
-        self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
-        self.mqtt_client.message_callback_add(f"{self.mqtt_prefix}/send", self.on_mqtt_message)
-        self.mqtt_client.connect(self.mqtt_host, self.mqtt_port)
-        self.mqtt_client.loop_start()
-
-        signal.signal(signal.SIGINT, self.shutdown)
-        signal.signal(signal.SIGTERM, self.shutdown)
-
-        try:
-            while self.running:
-                try:
-                    await asyncio.gather(
-                        self.get_and_publish_sms(),
-                        self.get_signal_info(),
-                        self.get_network_info(),
-                        self.get_datetime()
-                    )
-                    await asyncio.sleep(self.delay_second)
-                except ConnectionLostError:
-                    self.logger.error("Connection lost. Shutting down...")
-                    break
-                except asyncio.CancelledError:
-                    self.logger.info("Tasks cancelled")
-                    break
-                except Exception as e:
-                    self.logger.error(f"Error in main loop: {e}")
-                    await asyncio.sleep(5)  # Attendre un peu avant de réessayer
-        except asyncio.CancelledError:
-            self.logger.info("Main loop cancelled")
-        except Exception as e:
-            self.logger.error(f"Unexpected error in main loop: {e}")
-        finally:
             self.mqtt_client.loop_stop()
-            await self.force_shutdown()
+        if self.loop:
+            self.loop.stop()
+        self.logger.info("Arrêt terminé")
 
 if __name__ == "__main__":
     bridge = HuaweiSMSMQTTBridge()
-    asyncio.run(bridge.run())
-    
+    bridge.run()
