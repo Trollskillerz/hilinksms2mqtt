@@ -23,19 +23,17 @@ class HuaweiSMSMQTTBridge:
         self.token = None
         self.last_sms_time = 0
         self.sms_cooldown = 10  # Temps d'attente entre les SMS en secondes
+        self.check_interval = 60  # 60 secondes entre chaque vérification
+        self.sms_check_interval = 30  # 30 secondes entre chaque vérification des SMS
         self.last_status_check = 0
-        self.status_check_interval = 60  # 60 secondes entre chaque vérification
-        self.old_status_info = {}
         self.last_signal_check = 0
-        self.signal_check_interval = 60  # 60 secondes entre chaque vérification
-        self.old_signal_info = {}
         self.last_network_check = 0
-        self.network_check_interval = 60  # 60 secondes entre chaque vérification
+        self.last_sms_check = 0
+        self.old_status_info = {}        
+        self.old_signal_info = {}
         self.old_network_info = {}
         self.loop = None
-        self.last_token_time = 0
-        self.token_refresh_interval = 5  # 5 secondes, ou ajustez selon vos besoins        
-
+        
     def setup_logging(self):
         numeric_level = getattr(logging, self.debug_level, None)
         if not isinstance(numeric_level, int):
@@ -64,7 +62,8 @@ class HuaweiSMSMQTTBridge:
         self.mqtt_password = self.get_env("MQTT_PASSWORD")
         self.huawei_router_ip = self.get_env("HUAWEI_ROUTER_IP_ADDRESS")
         self.delay_second = int(self.get_env("DELAY_SECOND", "10"))
-        self.signal_check_interval = int(self.get_env("SIGNAL_CHECK_INTERVAL", "60"))
+        self.check_interval = int(self.get_env("CHECK_INTERVAL", "60"))
+        self.sms_check_interval = int(self.get_env("SMS_CHECK_INTERVAL", "30"))
         self.debug_level = os.environ.get("DEBUG_LEVEL", "INFO").upper()
         valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
         if self.debug_level not in valid_levels:
@@ -298,7 +297,7 @@ class HuaweiSMSMQTTBridge:
 
     async def get_signal_info(self):
         try:
-            if time.time() - self.last_signal_check < self.signal_check_interval:
+            if time.time() - self.last_signal_check < self.check_interval:
                 return
             self.last_signal_check = time.time()
 
@@ -341,7 +340,7 @@ class HuaweiSMSMQTTBridge:
 
     async def get_network_info(self):
         try:
-            if time.time() - self.last_network_check < self.network_check_interval:
+            if time.time() - self.last_network_check < self.check_interval:
                 return
             self.last_network_check = time.time()
 
@@ -376,29 +375,26 @@ class HuaweiSMSMQTTBridge:
         except Exception as e:
             self.logger.error(f"ERROR: Impossible de vérifier les informations réseau : {e}")
 
-    async def get_datetime(self):
-        # Implémentez cette méthode si nécessaire
-        pass
-
     async def main_loop(self):
         try:
             while self.running:
                 current_time = time.time()
-                # Traitement de la file d'attente SMS
-                await self.process_sms_queue()
                 # Vérification et publication du statut
-                if current_time - self.last_status_check >= self.status_check_interval:
+                if current_time - self.last_status_check >= self.check_interval:
                     await self.check_and_publish_status_info()
                     self.last_status_check = current_time
                 # Vérification et publication des informations de signal
-                if current_time - self.last_signal_check >= self.signal_check_interval:
+                if current_time - self.last_signal_check >= self.check_interval:
                     await self.get_signal_info()
                     self.last_signal_check = current_time
                 # Vérification et publication des informations réseau
-                if current_time - self.last_network_check >= self.network_check_interval:
+                if current_time - self.last_network_check >= self.check_interval:
                     await self.get_network_info()
                     self.last_network_check = current_time
-                await self.check_and_publish_received_sms()
+                # Vérification et publication des SMS reçus
+                if current_time - self.last_sms_check >= self.sms_check_interval:
+                    await self.check_and_publish_received_sms()
+                    self.last_sms_check = current_time
                 # Petite pause pour éviter une utilisation excessive du CPU
                 await asyncio.sleep(0.1)
         except asyncio.CancelledError:
