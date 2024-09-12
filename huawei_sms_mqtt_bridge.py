@@ -80,6 +80,9 @@ class HuaweiSMSMQTTBridge:
                     self.router_connected = True
                     self.mqtt_client.publish(f"{self.mqtt_prefix}/router_status", "connected", retain=True)
                 await asyncio.sleep(self.router_check_interval)
+            except asyncio.CancelledError:
+                self.logger.info("Tâche de vérification de la connexion du routeur annulée")
+                break
             except Exception as e:
                 self.logger.error(f"Erreur de connexion au routeur : {e}")
                 self.mqtt_client.publish(f"{self.mqtt_prefix}/router_status", "disconnected", retain=True)
@@ -294,9 +297,7 @@ class HuaweiSMSMQTTBridge:
             c.setopt(c.WRITEDATA, buffer)
             c.perform()
             c.close()
-            c.perform()
-            c.close()
-
+            
             response = buffer.getvalue().decode('utf-8')
             root = ET.fromstring(response)
             
@@ -427,9 +428,12 @@ class HuaweiSMSMQTTBridge:
         self.logger.info("Démarrage du bridge")
         try:
             self.loop.run_until_complete(self.run_async())
+        except KeyboardInterrupt:
+            self.logger.info("Interruption clavier détectée")
         except Exception as e:
             self.logger.error(f"Erreur dans la boucle principale : {e}")
         finally:
+            self.loop.run_until_complete(self.shutdown())
             self.loop.close()
             self.logger.info("Bridge arrêté")
 
@@ -456,9 +460,21 @@ class HuaweiSMSMQTTBridge:
             main_loop_task = asyncio.create_task(self.main_loop())
 
             self.logger.info("Démarrage de la boucle principale")
-            # Attendre que l'une des tâches se termine
-            await asyncio.wait([router_check_task, main_loop_task], return_when=asyncio.FIRST_COMPLETED)
+            # Attendre que l'une des tâches se termine ou que le script soit interrompu
+            done, pending = await asyncio.wait(
+                [router_check_task, main_loop_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
 
+            # Si check_router_connection se termine, arrêtez le script
+            if router_check_task in done:
+                self.logger.info("La tâche de vérification du routeur s'est terminée, arrêt du script")
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        except asyncio.CancelledError:
+            self.logger.info("Tâches annulées")
         except Exception as e:
             self.logger.error(f"Erreur dans run_async : {e}")
         finally:
@@ -467,17 +483,19 @@ class HuaweiSMSMQTTBridge:
     def signal_handler(self):
         self.logger.info("Signal reçu, arrêt en cours...")
         self.running = False
-        asyncio.create_task(self.shutdown())
+        if self.loop and self.loop.is_running():
+            self.loop.create_task(self.shutdown())
 
     async def shutdown(self):
-        self.logger.info("Arrêt gracieux...")
         if not self.running:
             return
+        self.logger.info("Arrêt gracieux...")
         self.running = False
         
         # Annuler toutes les tâches en cours
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-        [task.cancel() for task in tasks]
+        for task in tasks:
+            task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         
         # Arrêter le client MQTT
