@@ -1,0 +1,15 @@
+services:
+  huawei-sms-mqtt-bridge:
+    build: .
+    environment:
+      - MQTT_TOPIC=${MQTT_TOPIC}
+      - MQTT_IP=${MQTT_IP}
+      - PORT=${PORT}
+      - CLIENTID=${CLIENTID}
+      - MQTT_ACCOUNT=${MQTT_ACCOUNT}
+      - MQTT_PASSWORD=${MQTT_PASSWORD}
+      - HUAWEI_ROUTER_IP_ADDRESS=${HUAWEI_ROUTER_IP_ADDRESS}
+      - CHECK_INTERVAL=${CHECK_INTERVAL}
+      - SMS_CHECK_INTERVAL=${SMS_CHECK_INTERVAL}
+      - DEBUG_LEVEL=${DEBUG_LEVEL}
+    restart: unless-stopped
