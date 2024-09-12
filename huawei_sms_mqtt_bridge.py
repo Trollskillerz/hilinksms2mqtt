@@ -5,6 +5,9 @@ import signal
 import json
 import asyncio
 import pycurl
+import html
+import urllib.parse
+import threading
 import paho.mqtt.client as mqtt
 from datetime import datetime
 from xml.etree import ElementTree as ET
@@ -72,12 +75,16 @@ class HuaweiSMSMQTTBridge:
             raise ValueError(f"Niveau de debug invalide : {self.debug_level}. Les valeurs valides sont : {', '.join(valid_levels)}")
 
     async def check_router_connection(self):
+        failed_attempts = 0
+        max_failed_attempts = 3  # Nombre maximal de tentatives avant l'arrêt
+
         while self.running:
             try:
                 self.get_session_token()
                 if not self.router_connected:
                     self.logger.info("Connexion au routeur rétablie")
                     self.router_connected = True
+                    failed_attempts = 0  # Réinitialiser le compteur
                     self.mqtt_client.publish(f"{self.mqtt_prefix}/router_status", "connected", retain=True)
                 await asyncio.sleep(self.router_check_interval)
             except asyncio.CancelledError:
@@ -85,10 +92,16 @@ class HuaweiSMSMQTTBridge:
                 break
             except Exception as e:
                 self.logger.error(f"Erreur de connexion au routeur : {e}")
+                self.router_connected = False
+                failed_attempts += 1
                 self.mqtt_client.publish(f"{self.mqtt_prefix}/router_status", "disconnected", retain=True)
-                self.logger.info("Arrêt du script en raison de la déconnexion du routeur")
-                await self.shutdown()
-                break
+                
+                if failed_attempts >= max_failed_attempts:
+                    self.logger.critical(f"Échec de connexion au routeur après {max_failed_attempts} tentatives. Arrêt du script.")
+                    self.running = False
+                    break
+                
+                await asyncio.sleep(self.router_check_interval)
 
     def get_session_token(self):
         buffer = BytesIO()
@@ -186,6 +199,10 @@ class HuaweiSMSMQTTBridge:
         except Exception as e:
             self.logger.error(f"Erreur lors du marquage du SMS comme lu : {e}")
 
+    def encode_sms_content(self, content):
+        # Encode le contenu en UTF-8, puis le convertit en une chaîne URL-encodée
+        return content.encode('utf-8')
+
     def send_sms(self, phone, content, retry=False, retry_count=0):
         self.get_session_token()
         current_time = time.time()
@@ -202,8 +219,16 @@ class HuaweiSMSMQTTBridge:
             f"__RequestVerificationToken: {self.token}",
             "Content-Type: application/x-www-form-urlencoded; charset=UTF-8"
         ])
-        data = f"""<?xml version='1.0' encoding='UTF-8'?><request><Index>-1</Index><Phones><Phone>{phone}</Phone></Phones><Sca></Sca><Content>{content}</Content><Length>{len(content)}</Length><Reserved>1</Reserved><Date>-1</Date></request>"""
-        c.setopt(c.POSTFIELDS, data)
+        
+        # S'assurer que le contenu est une chaîne de caractères
+        if isinstance(content, bytes):
+            content = content.decode('utf-8')
+        
+        # Encoder le contenu en UTF-8
+        encoded_content = html.escape(content).encode('utf-8')
+        
+        data = f"""<?xml version='1.0' encoding='UTF-8'?><request><Index>-1</Index><Phones><Phone>{phone}</Phone></Phones><Sca></Sca><Content>{content}</Content><Length>{len(encoded_content)}</Length><Reserved>1</Reserved><Date>-1</Date></request>"""
+        c.setopt(c.POSTFIELDS, data.encode('utf-8'))
         c.setopt(c.WRITEDATA, buffer)
         c.perform()
         c.close()
@@ -249,23 +274,24 @@ class HuaweiSMSMQTTBridge:
     def on_mqtt_disconnect(self, client, userdata, rc, properties=None, reasonCode=None):
         self.logger.info("Déconnecté du serveur MQTT")
 
-    def on_mqtt_message(self, client, userdata, msg):
+    def on_mqtt_message(self, client, userdata, message):
         try:
-            payload = json.loads(msg.payload.decode())
-            if not isinstance(payload, dict) or 'number' not in payload or 'message' not in payload:
-                self.logger.error(f"Format de payload invalide: {msg.payload.decode()}")
-                return
-
-            self.logger.info(f"Message reçu sur le topic '{msg.topic}': {payload}")
-            if msg.topic == f"{self.mqtt_prefix}/send":
-                number = payload['number']
-                message = payload['message']
-                self.send_sms(number, message)
-        except json.JSONDecodeError as e:
-            self.logger.error(f"Erreur de décodage JSON: {e}")
+            payload_str = message.payload.decode('utf-8')
+            self.logger.info(f"Message reçu sur le topic '{message.topic}': {payload_str}")
+            payload = json.loads(payload_str)
+            number = payload.get('number')
+            text = payload.get('message')
+            
+            if number and text:
+                encoded_text = self.encode_sms_content(text)
+                self.send_sms(number, encoded_text)
+            else:
+                self.logger.warning("Message MQTT reçu sans numéro ou texte valide")
+        except json.JSONDecodeError:
+            self.logger.error(f"Erreur de décodage JSON pour le message reçu sur '{message.topic}'")
         except Exception as e:
-            self.logger.error(f"Erreur lors du traitement du message MQTT entrant sur le topic '{msg.topic}': {e}")
-
+            self.logger.error(f"Erreur lors du traitement du message MQTT entrant sur le topic '{message.topic}': {str(e)}")
+    
     async def process_sms_queue(self):
         if not self.sms_queue.empty():
             sms_request = self.sms_queue.get()
@@ -420,6 +446,9 @@ class HuaweiSMSMQTTBridge:
                 await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             self.logger.info("Boucle principale annulée")
+        except Exception as e:
+            self.logger.error(f"Erreur dans la boucle principale : {e}")
+            self.running = False
 
     def run(self):
         self.loop = asyncio.get_event_loop()
@@ -448,36 +477,30 @@ class HuaweiSMSMQTTBridge:
             self.mqtt_client.on_connect = self.on_mqtt_connect
             self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
             self.mqtt_client.message_callback_add(f"{self.mqtt_prefix}/send", self.on_mqtt_message)
+            self.mqtt_client.will_set(f"{self.mqtt_prefix}/connected", "0", 0, True)            
             self.logger.info("Tentative de connexion MQTT")
             self.mqtt_client.connect(self.mqtt_host, self.mqtt_port)
             self.mqtt_client.loop_start()
             self.logger.info("Boucle MQTT démarrée")
 
-            # Démarrer la tâche de vérification de la connexion du routeur
             router_check_task = asyncio.create_task(self.check_router_connection())
-
-            # Démarrer la boucle principale
             main_loop_task = asyncio.create_task(self.main_loop())
 
             self.logger.info("Démarrage de la boucle principale")
-            # Attendre que l'une des tâches se termine ou que le script soit interrompu
             done, pending = await asyncio.wait(
                 [router_check_task, main_loop_task],
                 return_when=asyncio.FIRST_COMPLETED
             )
 
-            # Si check_router_connection se termine, arrêtez le script
-            if router_check_task in done:
-                self.logger.info("La tâche de vérification du routeur s'est terminée, arrêt du script")
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
+            for task in pending:
+                task.cancel()
 
         except asyncio.CancelledError:
             self.logger.info("Tâches annulées")
         except Exception as e:
             self.logger.error(f"Erreur dans run_async : {e}")
         finally:
+            self.running = False
             await self.shutdown()
 
     def signal_handler(self):
@@ -496,13 +519,16 @@ class HuaweiSMSMQTTBridge:
         tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
         for task in tasks:
             task.cancel()
+        
+        # Attendre que toutes les tâches soient terminées
         await asyncio.gather(*tasks, return_exceptions=True)
         
         # Arrêter le client MQTT
         if self.mqtt_client:
+            self.logger.info("Publication du statut déconnecté")
             self.mqtt_client.publish(f"{self.mqtt_prefix}/connected", "0", 0, True)
-            self.mqtt_client.disconnect()
             self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
         
         self.logger.info("Arrêt terminé")
 
